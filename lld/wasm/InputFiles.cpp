@@ -362,6 +362,10 @@ static bool shouldMerge(const WasmSection &sec) {
 }
 
 static bool shouldMerge(const WasmSegment &seg) {
+  // No merge chunks when using linker scripts.
+  if (config->linkerScript)
+    return false;
+
   // As of now we only support merging strings, and only with single byte
   // alignment (2^0).
   if (!(seg.Data.LinkingFlags & WASM_SEG_FLAG_STRINGS) ||

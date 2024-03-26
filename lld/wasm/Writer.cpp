@@ -14,6 +14,7 @@
 #include "OutputSections.h"
 #include "OutputSegment.h"
 #include "Relocations.h"
+#include "ScriptParser.h"
 #include "SymbolTable.h"
 #include "SyntheticSections.h"
 #include "WriterUtils.h"
@@ -92,6 +93,7 @@ private:
   OutputSegment *createOutputSegment(StringRef name);
   void combineOutputSegments();
   void layoutMemory();
+  void runScript();
   void createHeader();
 
   void addSection(OutputSection *sec);
@@ -494,6 +496,231 @@ void Writer::layoutMemory() {
       else
         max = memoryPtr;
     }
+    out.memorySec->maxMemoryPages = max / WasmPageSize;
+    log("mem: max pages   = " + Twine(out.memorySec->maxMemoryPages));
+  }
+}
+
+void Writer::runScript() {
+  if (ctx.isPic || config->relocatable || config->globalBase) {
+    error("any kind of position independent/dynamic code can't be used with manual memory layout");
+  } else if (config->stackFirst) {
+    error("--stack-first can't be used with manual memory config (place it manually instead)");
+  }
+
+  llvm::SmallVector<InputChunk *, 0> inputSegments;
+  for (ObjFile *file : ctx.objectFiles) {
+    for (InputChunk *segment : file->segments) {
+      if (!segment->live)
+        continue;
+
+      inputSegments.push_back(segment);
+    }
+  }
+
+  // Place segments using linker script. Also assign symbols.
+  uint64_t memoryPtr = 0;
+  {
+    llvm::TimeTraceScope timeScope("Run linker script",
+                                   config->linkerScript->getBufferIdentifier());
+    ScriptParser parser{*config->linkerScript};
+    parser.readLinkerScript();
+
+    auto handleScriptSymbol = [&] (SymbolAssignment* assign, bool inSec) {
+      StringRef name = assign->name;
+      if (name != ".") {
+        if (!isValidCIdentifier(name))
+          return;
+
+        assign->addr = parser.dot;
+        ExprValue v = assign->expression();
+        uint64_t value = v.isAbsolute() ? v.getValue() : v.getSectionOffset();
+        log("SCRIPT SET " + name + " to " + Twine(value) + ", dot was " + Twine(parser.dot));
+        symtab->addOptionalDataSymbol(saver().save(name), value);
+        LLVM_DEBUG(dbgs() << "setSymbolAssignment: " << name << "\n");
+      } else { //if (assign->sym) {
+        //if (inSec) {
+        //  error("Assigning to . inside section is currently not supported");
+        //}
+
+        uint64_t val = assign->expression().getValue();
+        if (val < parser.dot)
+          error(assign->location + ": unable to move location counter backward for: " + name);
+
+        log("SCRIPT DOT " + name + " from " + Twine(parser.dot) + " to " + Twine(val));
+        parser.dot = val;
+        LLVM_DEBUG(dbgs() << "dotSymbolAssignment: " << parser.dot << "\n");
+      }
+    };
+
+    auto nameComparator = [](InputChunk *a, InputChunk *b) {
+      return a->name < b->name;
+    };
+
+    // Output sections need to have unique names.
+    // Example:
+    // osec->name: .rodata
+    // segment->name: .rodata.123
+    // segment->inputSegments: vector of InputChunk:s with names:
+    //   .rodata.foo
+    //   .rodata.foo (yes, again)
+    //   .rodata.bar
+    //   .my.custom.name (i.e. does not have to start with e.g. .rodata)
+    size_t osecUid = 0;
+    for (SectionCommand *base : parser.sectionCommands) {
+      if (auto *osd = dyn_cast<OutputDesc>(base)) {
+        SectionBase *osec = &osd->osec;
+
+        for (SectionCommand *cmd : osec->commands) {
+          if (auto *assign = dyn_cast<SymbolAssignment>(cmd)) {
+            handleScriptSymbol(assign, true);
+          } else if (auto *isd = dyn_cast<InputSectionDescription>(cmd)) {
+            // If dot is assigned or read while matching, we need to have new OutputSegments,
+            // so that the startVA can move (and the assignments will work). This means that
+            // there can be several output segments with the same name (a bit unfortunate).
+            OutputSegment *segment = make<OutputSegment>(
+                saver().save(osec->name + "." + Twine(osecUid++)));
+            segment->isBss = osec->name.starts_with(".bss");
+            if (config->sharedMemory)
+              segment->initFlags = WASM_DATA_SEGMENT_IS_PASSIVE;
+
+            for (const SectionPattern &pat : isd->sectionPatterns) {
+              if (!isd->filePat.isTrivialMatchAll() || !pat.excludedFilePat.empty())
+              error("Only trivial wildcard patterns are supported for file (i.e. *), no excludes");
+
+              if (pat.sortInner != SortSectionPolicy::Default &&
+                  pat.sortInner != SortSectionPolicy::None)
+                error("Only one level of sorting currently supported in linker scripts");
+
+              if (pat.sortOuter != SortSectionPolicy::Default &&
+                  pat.sortOuter != SortSectionPolicy::None &&
+                  pat.sortOuter != SortSectionPolicy::Name)
+                error("Only sorting on name is currently supported in linker scripts");
+
+              auto sortStart = segment->inputSegments.end();
+              for (InputChunk *chunk : inputSegments) {
+                // If an input is matched once, never match it again! (This is by spec.)
+                if (chunk->outputSeg)  // Set by addInputSegment() below.
+                  continue;
+
+                if (!pat.sectionPat.match(chunk->name))
+                     //|| !isd->matchesFile(sec->file) || pat.excludesFile(sec->file))
+                  continue;
+
+                log("MAPPING " + segment->name + " <--- " + chunk->name);
+                if (osec->name == "/DISCARD/") {
+                  // The output section name `/DISCARD/' is special.
+                  // Any input section assigned to it is discarded.
+                  chunk->discarded = true;
+                } else {
+                  segment->addInputSegment(chunk); // Sets chunk->outputSeg.
+                  assert(chunk->outputSeg);
+                }
+              }
+              auto sortEnd = segment->inputSegments.end();
+
+              // Sorting happens on each pattern, for example *(.foo SORT(.bar.*) .baz)
+              if (pat.sortOuter == SortSectionPolicy::Name)
+                std::stable_sort(sortStart, sortEnd, nameComparator);
+            }
+
+            if (osec->name != "/DISCARD/" && !segment->inputSegments.empty()) {
+              // The linker script will align dot directly itself. However, we might have to
+              // increase the alignment to what came from the input files, moving the dot too.
+              segment->finalizeInputSegments();  // Bake everything, so that we know the size.
+              log("SCRIPT PLACE " + segment->name + " with size " + Twine(segment->size) +
+                  " dot: script " + Twine(parser.dot) +
+                  " seg " + Twine(alignTo(parser.dot, 1ULL << segment->alignment)));
+
+              parser.dot = alignTo(parser.dot, 1ULL << segment->alignment);
+              segment->startVA = parser.dot;
+              parser.dot += segment->size;
+
+              log(formatv("mem: {0,-15} offset={1,-8} size={2,-8} align={3}", segment->name,
+                      segment->startVA, segment->size, segment->alignment));
+
+              segments.push_back(segment);
+            }
+          }
+        }
+      } else if (auto *assign = dyn_cast<SymbolAssignment>(base)) {
+        handleScriptSymbol(assign, false);
+      }
+    }
+
+    // Place any remaining segments that were not discarded.
+    OutputSegment *bonusdata = createOutputSegment(".data.bonus");  // Will call segments.push_back()
+    OutputSegment *bonusbss = createOutputSegment(".bss.bonus");  // Will call segments.push_back()
+    for (InputChunk *chunk : inputSegments) {
+      if (!chunk->outputSeg && !chunk->discarded) {
+        log("BONUS <--- " + chunk->name);
+        (chunk->name.starts_with(".bss") ? bonusbss : bonusdata)->addInputSegment(chunk);
+      }
+    }
+
+    bonusdata->finalizeInputSegments();
+    parser.dot = alignTo(parser.dot, 1ULL << bonusdata->alignment);
+    bonusdata->startVA = parser.dot;
+    parser.dot += bonusdata->size;
+
+    bonusbss->finalizeInputSegments();
+    parser.dot = alignTo(parser.dot, 1ULL << bonusbss->alignment);
+    bonusbss->startVA = parser.dot;
+    parser.dot += bonusbss->size;
+
+    memoryPtr = parser.dot;
+  }
+
+  // This works fine if there is only one bss segment and it comes last.
+  // But we can/will have at least two, so let's fake index.
+  size_t nonIndex = 0;
+  for (size_t i = 0; i < segments.size(); ++i)
+    if (needsPassiveInitialization(segments[i]) && !segments[i]->isBss)
+      segments[i]->index = nonIndex++;
+    else
+      segments[i]->index = static_cast<uint32_t>(-1);
+
+  // Make space for the memory initialization flag
+  if (config->sharedMemory && hasPassiveInitializedSegments()) {
+    memoryPtr = alignTo(memoryPtr, 4);
+    WasmSym::initMemoryFlag = symtab->addSyntheticDataSymbol(
+        "__wasm_init_memory_flag", WASM_SYMBOL_VISIBILITY_HIDDEN);
+    WasmSym::initMemoryFlag->markLive();
+    WasmSym::initMemoryFlag->setVA(memoryPtr);
+    log(formatv("mem: {0,-15} offset={1,-8} size={2,-8} align={3}",
+                "__wasm_init_memory_flag", memoryPtr, 4, 4));
+    memoryPtr += 4;
+  }
+
+  memoryPtr = alignTo(memoryPtr, WasmPageSize);
+  out.memorySec->numMemoryPages = memoryPtr / WasmPageSize;
+  log("mem: total pages = " + Twine(out.memorySec->numMemoryPages));
+
+  uint64_t maxMemorySetting = 1ULL << (config->is64.value_or(false) ? 48 : 32);
+  if (config->initialMemory != 0) {
+    if (config->initialMemory != alignTo(config->initialMemory, WasmPageSize))
+      error("initial memory must be " + Twine(WasmPageSize) + "-byte aligned");
+    if (memoryPtr > config->initialMemory)
+      error("initial memory too small, " + Twine(memoryPtr) + " bytes needed");
+    if (config->initialMemory > maxMemorySetting)
+      error("initial memory too large, cannot be greater than " +
+            Twine(maxMemorySetting));
+    memoryPtr = config->initialMemory;
+  }
+
+  if (config->maxMemory != 0) {
+    if (config->maxMemory != alignTo(config->maxMemory, WasmPageSize))
+      error("maximum memory must be " + Twine(WasmPageSize) + "-byte aligned");
+    if (memoryPtr > config->maxMemory)
+      error("maximum memory too small, " + Twine(memoryPtr) + " bytes needed");
+    if (config->maxMemory > maxMemorySetting)
+      error("maximum memory too large, cannot be greater than " +
+            Twine(maxMemorySetting));
+  }
+
+  // Check max if explicitly supplied or required by shared memory
+  if (config->maxMemory != 0 || config->sharedMemory) {
+    uint64_t max = config->maxMemory ? config->maxMemory : memoryPtr;
     out.memorySec->maxMemoryPages = max / WasmPageSize;
     log("mem: max pages   = " + Twine(out.memorySec->maxMemoryPages));
   }
@@ -1694,12 +1921,18 @@ void Writer::run() {
       WasmSym::definedTableBase32->setVA(config->tableBase);
   }
 
-  log("-- createOutputSegments");
-  createOutputSegments();
   log("-- createSyntheticSections");
   createSyntheticSections();
-  log("-- layoutMemory");
-  layoutMemory();
+
+  if (!config->linkerScript) {
+    log("-- createOutputSegments");
+    createOutputSegments();
+    log("-- layoutMemory");
+    layoutMemory();
+  } else {
+    log("-- runScript");
+    runScript();
+  }
 
   if (!config->relocatable) {
     // Create linker synthesized __start_SECNAME/__stop_SECNAME symbols

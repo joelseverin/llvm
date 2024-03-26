@@ -57,6 +57,7 @@ struct Configuration {
   bool growableTable;
   bool gcSections;
   llvm::StringSet<> keepSections;
+  std::optional<llvm::MemoryBufferRef> linkerScript;
   std::optional<std::pair<llvm::StringRef, llvm::StringRef>> memoryImport;
   std::optional<llvm::StringRef> memoryExport;
   bool sharedMemory;

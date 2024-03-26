@@ -294,6 +294,8 @@ def thinlto_jobs: JJ<"thinlto-jobs=">,
 def lto_debug_pass_manager: FF<"lto-debug-pass-manager">,
   HelpText<"Debug new pass manager">;
 
+defm script: Eq<"script", "Use linker script ((very) limited support for GNU ld/ELF linker scripts)">;
+
 // Experimental PIC mode.
 def experimental_pic: FF<"experimental-pic">,
   HelpText<"Enable Experimental PIC">;

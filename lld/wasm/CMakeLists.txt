@@ -12,6 +12,8 @@ add_lld_library(lldWasm
   OutputSections.cpp
   OutputSegment.cpp
   Relocations.cpp
+  ScriptLexer.cpp
+  ScriptParser.cpp
   SymbolTable.cpp
   Symbols.cpp
   SyntheticSections.cpp

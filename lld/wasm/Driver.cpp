@@ -327,6 +327,15 @@ static std::optional<std::string> findFromSearchPaths(StringRef path) {
   return std::nullopt;
 }
 
+// If a linker/version script doesn't exist in the current directory, we also
+// look for the script in the '-L' search paths. This matches the behaviour of
+// '-T', --version-script=, and linker script INPUT() command in ld.bfd.
+static std::optional<std::string> searchScript(StringRef name) {
+  if (fs::exists(name))
+    return name.str();
+  return findFromSearchPaths(name);
+}
+
 // This is for -l<basename>. We'll look for lib<basename>.a from
 // search paths.
 static std::optional<std::string> searchLibraryBaseName(StringRef name) {
@@ -387,6 +396,13 @@ void LinkerDriver::createFiles(opt::InputArgList &args) {
       if (!inLib)
         error("stray --end-lib");
       inLib = false;
+      break;
+    case OPT_script:
+      if (std::optional<std::string> path = searchScript(arg->getValue())) {
+        config->linkerScript = readFile(*path);
+      } else {
+        error(Twine("cannot find linker script ") + arg->getValue());
+      }
       break;
     }
   }
@@ -617,12 +633,6 @@ static void setConfigs() {
     // pointer.
     if (!config->tableBase)
       config->tableBase = 1;
-    // The default offset for static/global data, for when --global-base is
-    // not specified on the command line.  The precise value of 1024 is
-    // somewhat arbitrary, and pre-dates wasm-ld (Its the value that
-    // emscripten used prior to wasm-ld).
-    if (!config->globalBase && !config->relocatable && !config->stackFirst)
-      config->globalBase = 1024;
   }
 
   if (config->relocatable) {
@@ -1194,6 +1204,14 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   createFiles(args);
   if (errorCount())
     return;
+
+  // The default offset for static/global data, for when --global-base is
+  // not specified on the command line.  The precise value of 1024 is
+  // somewhat arbitrary, and pre-dates wasm-ld (Its the value that
+  // emscripten used prior to wasm-ld).
+  if (!config->globalBase && !config->linkerScript && !ctx.isPic &&
+      !config->relocatable && !config->stackFirst)
+    config->globalBase = 1024;
 
   checkOptions(args);
   if (errorCount())
