@@ -115,6 +115,8 @@ public:
       case 'S':
         flags |= wasm::WASM_SEG_FLAG_STRINGS;
         break;
+      case 'a': // SHF_ALLOC - not meaningful for Wasm, ignore.
+        break;
       default:
         return -1U;
       }
