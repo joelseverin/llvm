@@ -178,8 +178,11 @@ public:
 
     Lex();
 
-    if (expect(AsmToken::Comma, ",") || expect(AsmToken::At, "@"))
-      return true;
+    if (Lexer->is(AsmToken::Comma)) {
+      Lex();
+      if (expect(AsmToken::At, "@"))
+        return true;
+    }
 
     StringRef GroupName;
     if (Group && parseGroup(GroupName))
