@@ -1628,12 +1628,8 @@ uint64_t WasmObjectWriter::writeOneObject(MCAssembler &Asm,
           continue;
         }
 
-        if (!WS.getSize())
-          report_fatal_error("data symbols must have a size set with .size: " +
-                             WS.getName());
-
         int64_t Size = 0;
-        if (!WS.getSize()->evaluateAsAbsolute(Size, Layout))
+        if (WS.getSize() && !WS.getSize()->evaluateAsAbsolute(Size, Layout))
           report_fatal_error(".size expression must be evaluatable");
 
         auto &DataSection = static_cast<MCSectionWasm &>(WS.getSection());
