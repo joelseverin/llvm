@@ -57,6 +57,7 @@ public:
     addDirectiveHandler<&WasmAsmParser::parseSectionDirectiveText>(".text");
     addDirectiveHandler<&WasmAsmParser::parseSectionDirectiveData>(".data");
     addDirectiveHandler<&WasmAsmParser::parseSectionDirective>(".section");
+    addDirectiveHandler<&WasmAsmParser::parseSectionDirectivePrevious>(".previous");
     addDirectiveHandler<&WasmAsmParser::parseDirectiveSize>(".size");
     addDirectiveHandler<&WasmAsmParser::parseDirectiveType>(".type");
     addDirectiveHandler<&WasmAsmParser::ParseDirectiveIdent>(".ident");
@@ -209,6 +210,14 @@ public:
     }
 
     getStreamer().switchSection(WS);
+    return false;
+  }
+
+  bool parseSectionDirectivePrevious(StringRef, SMLoc) {
+    MCSectionSubPair PreviousSection = getStreamer().getPreviousSection();
+    if (PreviousSection.first == nullptr)
+      return TokError(".previous without a corresponding .section");
+    getStreamer().switchSection(PreviousSection.first, PreviousSection.second);
     return false;
   }
 
