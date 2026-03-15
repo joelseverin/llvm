@@ -120,6 +120,18 @@ public:
         break;
       case 'a': // SHF_ALLOC - not meaningful for Wasm, ignore.
         break;
+      case 'w': // SHF_WRITE - not meaningful for Wasm, ignore.
+        break;
+      case 'x': // SHF_EXECINSTR - not meaningful for Wasm, ignore.
+        break;
+      case 'M': // SHF_MERGE - not meaningful for Wasm, ignore.
+        break;
+      case 'R': // SHF_GNU_RETAIN - not meaningful for Wasm, ignore.
+        break;
+      case 'e': // SHF_EXCLUDE - not meaningful for Wasm, ignore.
+        break;
+      case 'o': // SHF_LINK_ORDER - not meaningful for Wasm, ignore.
+        break;
       default:
         return -1U;
       }
