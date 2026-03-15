@@ -197,8 +197,13 @@ public:
 
     if (Lexer->is(AsmToken::Comma)) {
       Lex();
-      if (expect(AsmToken::At, "@"))
-        return true;
+      // Swallow @type and %type.
+      if (!isNext(AsmToken::At) && !isNext(AsmToken::Percent))
+        return error("expected '@' or '%' before section type, got: ",
+                     Lexer->getTok());
+      // May fail, which is ok: we want to allow only @ or % without type too.
+      StringRef TypeName;
+      Parser->parseIdentifier(TypeName);
     }
 
     StringRef GroupName;
