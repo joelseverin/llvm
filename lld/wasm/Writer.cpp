@@ -1062,7 +1062,8 @@ void Writer::populateSymtab() {
   for (ObjFile *file : ctx.objectFiles) {
     LLVM_DEBUG(dbgs() << "Local symtab entries: " << file->getName() << "\n");
     for (Symbol *sym : file->getSymbols())
-      if (sym->isLocal() && !isa<SectionSymbol>(sym) && sym->isLive())
+      if (sym->isLocal() && !isa<SectionSymbol>(sym) && sym->isLive() &&
+          !sym->hasOutputSymbolIndex())
         out.linkingSec->addToSymtab(sym);
   }
 }

@@ -947,12 +947,13 @@ void SymbolTable::handleSymbolVariants() {
     }
 #endif
 
-    // Find the one definition.
+    // Find the one definition, preferring non-weak definitions.
     DefinedFunction *defined = nullptr;
     for (auto *symbol : variants) {
       if (auto f = dyn_cast<DefinedFunction>(symbol)) {
         defined = f;
-        break;
+        if (!f->isWeak())
+          break;
       }
     }
 
@@ -966,10 +967,38 @@ void SymbolTable::handleSymbolVariants() {
       return;
     }
 
+    // replace() displaces variants[0] from symtab->symbols() whenever a
+    // later variant takes the global slot, so the global Writer loop may not
+    // find it.  Force LOCAL so the local Writer loop adds it exactly once
+    // (the hasOutputSymbolIndex guard prevents a double-add if the global
+    // loop already picked it up).
+    auto *primary0 = dyn_cast<DefinedFunction>(variants[0]);
+    if (primary0)
+      primary0->flags = (primary0->flags & ~WASM_SYMBOL_BINDING_MASK) |
+                        WASM_SYMBOL_BINDING_LOCAL;
+
+    // If the chosen definition is not variants[0], promote variants[0] to
+    // carry the real function body so that replaceWithUnreachable is only
+    // called on fresh (non-primary) variant slots.
+    DefinedFunction *promotionSource = nullptr;
+    if (defined != variants[0] && primary0) {
+      promotionSource = defined;
+      primary0->function = defined->function;
+      primary0->signature = defined->signature;
+      defined = primary0;
+    }
+
     for (auto *symbol : variants) {
       if (symbol != defined) {
         auto *f = cast<FunctionSymbol>(symbol);
-        reportFunctionSignatureMismatch(symName, f, defined, false);
+        // Warn for function definition mismatches, unless the chosen one is
+        // non-weak and the other is weak. This allows vague sentinel values.
+        // Also skip for the slot we promoted the definition from: after
+        // promotion its signature matches defined, so there is nothing to warn.
+        auto *weakDef = dyn_cast<DefinedFunction>(symbol);
+        if (symbol != promotionSource &&
+            (!weakDef || !weakDef->isWeak() || defined->isWeak()))
+          reportFunctionSignatureMismatch(symName, f, defined, false);
         StringRef debugName =
             saver().save("signature_mismatch:" + toString(*f));
         replaceWithUnreachable(f, *f->signature, debugName);

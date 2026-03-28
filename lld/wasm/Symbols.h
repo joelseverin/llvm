@@ -131,6 +131,7 @@ public:
 
   void setGOTIndex(uint32_t index);
   bool hasGOTIndex() const { return gotIndex != INVALID_INDEX; }
+  bool hasOutputSymbolIndex() const { return outputSymbolIndex != INVALID_INDEX; }
 
 protected:
   Symbol(StringRef name, Kind k, uint32_t flags, InputFile *f)
